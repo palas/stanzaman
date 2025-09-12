@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs::canonicalize, path::Path, process::exit};
+use std::{
+    collections::HashMap,
+    fs::{File, canonicalize},
+    path::Path,
+    process::exit,
+};
 
 use thiserror::Error;
 
@@ -34,9 +39,18 @@ enum CommandError {
     CouldNotCanonicalizePath(String),
     #[error("Could not find repository origin: {0}")]
     CouldNotFindRepoOrigin(String),
+    #[error("Could not find commit hash: {0}")]
+    CouldNotFindCommitHash(String),
+    #[error("Could not sha256 nix hash for commit: {0}")]
+    CouldNotFindNixSha256Hash(String),
     #[error("Repo \"{0}\" already registered")]
     RepoAlreadyRegistered(String),
+    #[error("Repo \"{0}\" not registered. Please add it first using `add-repo`")]
+    RepoNotRegistered(String),
 }
+
+const BEGIN_MARKER: &str = "-- BEGIN SRP STANZAS MANAGED BY STANZAMAN --";
+const END_MARKER: &str = "-- END SRP STANZAS MANAGED BY STANZAMAN --";
 
 fn main() {
     if let Err(e) = run() {
@@ -298,6 +312,55 @@ fn find_repo_origin(canonical_path: &Path) -> Result<String, Box<dyn std::error:
     }
 }
 
+fn get_commit_for_repo(canonical_path: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    // Run "git rev-parse HEAD" on folder to get current commit
+    let output = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("HEAD")
+        .current_dir(canonical_path)
+        .output()
+        .map_err(|e| Box::new(CommandError::CouldNotFindCommitHash(e.to_string())))?;
+    if output.status.success() {
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Ok(commit)
+    } else {
+        Err(Box::new(CommandError::CouldNotFindCommitHash(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )))
+    }
+}
+
+fn get_hash_for_commit(
+    canonical_path: &Path,
+    origin: &str,
+    commit: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("nix-prefetch-git")
+        .arg(origin)
+        .arg(commit)
+        .current_dir(canonical_path)
+        .output()
+        .map_err(|e| Box::new(CommandError::CouldNotFindNixSha256Hash(e.to_string())))?;
+    if output.status.success() {
+        let sha256 = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .map_err(|e| Box::new(CommandError::CouldNotFindNixSha256Hash(e.to_string())))?
+            .get("sha256")
+            .ok_or(Box::new(CommandError::CouldNotFindNixSha256Hash(
+                "No sha256 field in output".to_string(),
+            )))?
+            .as_str()
+            .ok_or(Box::new(CommandError::CouldNotFindNixSha256Hash(
+                "sha256 field is not a string".to_string(),
+            )))?
+            .to_string();
+        Ok(sha256)
+    } else {
+        Err(Box::new(CommandError::CouldNotFindNixSha256Hash(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )))
+    }
+}
+
 // Initialize the stanzaman database
 fn init_stanzaman() -> Result<(), Box<dyn std::error::Error>> {
     println!("Initializing stanzaman database...");
@@ -357,7 +420,144 @@ fn add_dependency_for_repo(
         "Adding stanza to \"{}\" with dependency \"{}\"",
         repo_alias, dep_alias
     );
+    let mut config: Config = read_config()?;
+    let (dep_commit, dep_hash) = get_dep_commit_and_hash(dep_alias)?;
+    let repo_path = {
+        let repo: &mut Repo = config
+            .repos
+            .get_mut(repo_alias)
+            .ok_or_else(|| Box::new(CommandError::RepoNotRegistered(repo_alias.to_string())))?;
+        let dep_info = Dep {
+            commit: dep_commit,
+            hash: dep_hash,
+        };
+        repo.dependencies.insert(dep_alias.to_string(), dep_info);
+        repo.path.clone()
+    };
+    write_config(&config)?;
+    update_stanzas_for_repo(&config, repo_path.as_ref(), repo_alias)?;
     Ok(())
+}
+
+fn update_stanzas_for_repo(
+    config: &Config,
+    path: &Path,
+    repo_alias: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cabal_file_path = path.join("cabal.project");
+    let repo = config
+        .repos
+        .get(repo_alias)
+        .ok_or_else(|| Box::new(CommandError::RepoNotRegistered(repo_alias.to_string())))?;
+
+    let mut updated_stanza = String::new();
+    updated_stanza.push_str(BEGIN_MARKER);
+    updated_stanza.push_str("\n\n");
+    for (
+        dep_alias,
+        Dep {
+            commit: dep_commit,
+            hash: dep_sha256,
+        },
+    ) in repo.dependencies.iter()
+    {
+        let dep_origin = config
+            .repos
+            .get(dep_alias)
+            .ok_or_else(|| Box::new(CommandError::RepoNotRegistered(dep_alias.to_string())))?
+            .origin
+            .clone();
+        updated_stanza.push_str(&format!(
+            "source-repository-package\n  \
+               type: git\n  \
+               location: {}\n  \
+               tag: {}\n  \
+               subdir: {}\n  \
+               --sha256: sha256-{}\n\n",
+            dep_origin, dep_commit, dep_alias, dep_sha256
+        ));
+    }
+    updated_stanza.push_str(END_MARKER);
+    updated_stanza.push_str("\n");
+    if repo.dependencies.is_empty() {
+        return Ok(());
+    } else {
+        update_cabal_file(&cabal_file_path, &updated_stanza)?;
+    }
+    Ok(())
+}
+
+fn update_cabal_file(
+    cabal_file_path: &std::path::PathBuf,
+    updated_stanza: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cabal_file_content = if cabal_file_path.exists() {
+        std::fs::read_to_string(cabal_file_path)?
+    } else {
+        String::new()
+    };
+
+    let has_placeholders = !cabal_file_content
+        .lines()
+        .all(|line| line.trim() != BEGIN_MARKER && line.trim() != END_MARKER);
+
+    let (before, after): (
+        Box<dyn Iterator<Item = &str>>,
+        Box<dyn Iterator<Item = &str>>,
+    ) = {
+        if has_placeholders {
+            // Split the file into before the BEGIN_MARKER and after the END_MARKER
+            let before = cabal_file_content
+                .lines()
+                .take_while(|line| line.trim() != BEGIN_MARKER);
+            let after = cabal_file_content
+                .lines()
+                .skip_while(|line| line.trim() != END_MARKER)
+                .skip(1);
+            (Box::new(before), Box::new(after))
+        } else {
+            let has_package_section = cabal_file_content
+                .lines()
+                .any(|line| line.trim_start().starts_with("packages:"));
+            if has_package_section {
+                // Split the file into before the "packages:" section and from it on (adding a newline before the packages section)
+                let before = cabal_file_content
+                    .lines()
+                    .take_while(|line| !line.trim_start().starts_with("packages:"));
+                let after = cabal_file_content
+                    .lines()
+                    .skip_while(|line| !line.trim_start().starts_with("packages:"));
+                (Box::new(before), Box::new("\n".lines().chain(after)))
+            } else {
+                (
+                    // No markers and no packages section, just insert at the beginning
+                    Box::new(std::iter::empty()),
+                    Box::new("\n".lines().chain(cabal_file_content.lines())),
+                )
+            }
+        }
+    };
+    let updated_stanza: Box<dyn Iterator<Item = &str>> = Box::new(updated_stanza.lines());
+    let new_cabal_file_content = before.chain(updated_stanza).chain(after);
+    let output_file = File::create(cabal_file_path)?;
+    new_cabal_file_content.for_each(|line| {
+        use std::io::Write;
+        writeln!(&output_file, "{}", line).unwrap();
+    });
+    Ok(())
+}
+
+fn get_dep_commit_and_hash(
+    dep_alias: &str,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let config = read_config()?;
+    let dep = config
+        .repos
+        .get(dep_alias)
+        .ok_or_else(|| Box::new(CommandError::RepoNotRegistered(dep_alias.to_string())))?;
+    let hash = get_commit_for_repo(dep.path.as_ref())?;
+    let sha256 = get_hash_for_commit(dep.path.as_ref(), &dep.origin, &hash)?;
+    Ok((hash, sha256))
 }
 
 // Update the stanzaman database
