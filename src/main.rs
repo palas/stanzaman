@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{File, canonicalize},
     path::Path,
     process::exit,
@@ -421,7 +421,7 @@ fn add_dependency_for_repo(
         repo_alias, dep_alias
     );
     let mut config: Config = read_config()?;
-    let (dep_commit, dep_hash) = get_dep_commit_and_hash(dep_alias)?;
+    let (dep_commit, dep_hash) = get_dep_commit_and_hash(dep_alias, None)?;
     let repo_path = {
         let repo: &mut Repo = config
             .repos
@@ -549,6 +549,7 @@ fn update_cabal_file(
 
 fn get_dep_commit_and_hash(
     dep_alias: &str,
+    current_commit: Option<String>,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
     let config = read_config()?;
     let dep = config
@@ -556,6 +557,11 @@ fn get_dep_commit_and_hash(
         .get(dep_alias)
         .ok_or_else(|| Box::new(CommandError::RepoNotRegistered(dep_alias.to_string())))?;
     let hash = get_commit_for_repo(dep.path.as_ref())?;
+    if let Some(current_commit) = current_commit {
+        if current_commit == hash {
+            return Ok((current_commit, hash));
+        }
+    }
     let sha256 = get_hash_for_commit(dep.path.as_ref(), &dep.origin, &hash)?;
     Ok((hash, sha256))
 }
@@ -563,6 +569,28 @@ fn get_dep_commit_and_hash(
 // Update the stanzaman database
 fn update_stanzaman() -> Result<(), Box<dyn std::error::Error>> {
     println!("Updating stanzaman database...");
+    let mut config = read_config()?;
+    let mut updated_repos = HashSet::new();
+    for (_repo_alias, repo) in config.repos.iter_mut() {
+        for (dep_alias, dep) in repo.dependencies.iter_mut() {
+            let (new_commit, new_sha256) =
+                get_dep_commit_and_hash(dep_alias, Some(dep.commit.clone()))?; // ToDo: only check hash if commit is different
+            if dep.commit != new_commit {
+                dep.commit = new_commit;
+                dep.hash = new_sha256;
+                updated_repos.insert(repo.alias.clone());
+            }
+        }
+    }
+    for repo_alias in updated_repos {
+        let repo = config
+            .repos
+            .get(&repo_alias)
+            .ok_or_else(|| Box::new(CommandError::RepoNotRegistered(repo_alias.clone())))?;
+        update_stanzas_for_repo(&config, repo.path.as_ref(), &repo_alias)?;
+        println!("Updated stanzas for repo \"{}\"", repo_alias);
+    }
+    write_config(&config)?;
     Ok(())
 }
 
