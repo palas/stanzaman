@@ -473,7 +473,7 @@ fn update_stanzas_for_repo(
                location: {}\n  \
                tag: {}\n  \
                subdir: {}\n  \
-               --sha256: sha256-{}\n\n",
+               --sha256: {}\n\n",
             dep_origin, dep_commit, dep_alias, dep_sha256
         ));
     }
