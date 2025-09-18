@@ -304,6 +304,11 @@ fn find_repo_origin(canonical_path: &Path) -> Result<String, Box<dyn std::error:
         .map_err(|e| Box::new(CommandError::CouldNotFindRepoOrigin(e.to_string())))?;
     if output.status.success() {
         let origin = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(suffix) = origin.strip_prefix("git@github.com:") {
+            let mut fixed_origin = suffix.to_string();
+            fixed_origin.insert_str(0, "https://github.com/");
+            return Ok(fixed_origin);
+        }
         Ok(origin)
     } else {
         Err(Box::new(CommandError::CouldNotFindRepoOrigin(
